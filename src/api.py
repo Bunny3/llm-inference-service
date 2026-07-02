@@ -1,0 +1,80 @@
+# src/api.py
+import asyncio
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from src.config import config
+from src.queue_worker import inference_queue
+
+
+app = FastAPI(
+    title="LLM Inference Service",
+    description="Production-style LLM inference with request queuing",
+    version="1.0.0",
+)
+
+
+# --- Schemas ---
+
+class GenerateRequest(BaseModel):
+    prompt: str
+    max_tokens: int = 512
+
+
+class GenerateResponse(BaseModel):
+    response: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    tokens_per_second: float
+    latency_ms: float
+    queue_wait_ms: float
+
+
+# --- Lifecycle ---
+
+@app.on_event("startup")
+async def startup():
+    config.validate()
+    await inference_queue.start()
+    print("🚀 LLM Inference Service ready.")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    await inference_queue.stop()
+
+
+# --- Endpoints ---
+
+@app.post("/generate", response_model=GenerateResponse)
+async def generate(request: GenerateRequest):
+    """
+    Submit a prompt for LLM inference.
+    Requests are queued and processed one at a time for maximum throughput.
+    Returns 503 if the queue is full.
+    """
+    try:
+        result = await inference_queue.submit(request.prompt)
+        return GenerateResponse(**result)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
+
+
+@app.get("/health")
+async def health():
+    """Health check with queue stats."""
+    return {
+        "status": "ok",
+        "model": config.OLLAMA_MODEL,
+        **inference_queue.stats,
+    }
+
+
+@app.get("/models")
+async def list_models():
+    """List locally available Ollama models."""
+    from src.ollama_client import OllamaClient
+    client = OllamaClient()
+    return {"models": client.list_models()}
