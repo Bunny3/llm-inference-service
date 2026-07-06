@@ -64,6 +64,13 @@ curl -N -X POST http://localhost:8001/generate/stream \
   -d '{"prompt": "Write a haiku about databases"}'
 ```
 
+## Load testing (Locust, 5 concurrent users)
+- 143 total requests over ~50s, 75 rejected with 429 (rate limit)
+- p50: 2ms, p95: 5ms, p99: 1200ms
+- 0 failures on /health — monitoring stays responsive under /generate saturation
+- Rate limiter (capacity=5, refill=0.5/sec) is the binding constraint at ~2.7 RPS,
+  not queue depth (max=10) — confirmed via Locust FAILURES tab showing 429s, not 503s
+
 ## Tech stack
 
 Python, FastAPI, asyncio, Ollama, requests
