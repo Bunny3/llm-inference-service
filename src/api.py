@@ -10,9 +10,11 @@ from fastapi import Request
 from src.rate_limiter import rate_limiter
 from fastapi import Depends
 from src.cache import prompt_cache
-
+from src.redis_queue import RedisInferenceQueue
 
 ollama_client = OllamaClient()
+
+redis_queue = RedisInferenceQueue(config.REDIS_URL) if config.USE_REDIS_QUEUE else None
 
 app = FastAPI(
     title="LLM Inference Service",
@@ -44,12 +46,18 @@ class GenerateResponse(BaseModel):
 async def startup():
     config.validate()
     await inference_queue.start()
-    print("🚀 LLM Inference Service ready.")
+    if redis_queue:
+        await redis_queue.start()
+        print("🚀 Redis-backed queue active for /generate.")
+    else:
+        print("🚀 In-memory queue active for /generate.")
 
 
 @app.on_event("shutdown")
 async def shutdown():
     await inference_queue.stop()
+    if redis_queue:
+        await redis_queue.stop()
 
 
 # --- Endpoints ---
@@ -70,7 +78,8 @@ async def generate(request: GenerateRequest, _=Depends(enforce_rate_limit)):
         return GenerateResponse(**{**cached, "queue_wait_ms": 0.0})
 
     try:
-        result = await inference_queue.submit(request.prompt)
+        active_queue = redis_queue if redis_queue else inference_queue
+        result = await active_queue.submit(request.prompt)
         prompt_cache.set(request.prompt, config.TEMPERATURE, request.max_tokens, result)
         return GenerateResponse(**result)
     except RuntimeError as e:
@@ -82,10 +91,12 @@ async def generate(request: GenerateRequest, _=Depends(enforce_rate_limit)):
 @app.get("/health")
 async def health():
     """Health check with queue stats."""
+    queue_stats = await redis_queue.stats() if redis_queue else inference_queue.stats
     return {
         "status": "ok",
         "model": config.OLLAMA_MODEL,
-        **inference_queue.stats,
+        "queue_backend": "redis" if redis_queue else "in-memory",
+        **queue_stats,
         **prompt_cache.stats,
     }
 
