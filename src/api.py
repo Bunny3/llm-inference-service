@@ -11,6 +11,11 @@ from src.rate_limiter import rate_limiter
 from fastapi import Depends
 from src.cache import prompt_cache
 from src.redis_queue import RedisInferenceQueue
+from src.metrics import (
+    REQUESTS_TOTAL, CACHE_HITS_TOTAL, CACHE_MISSES_TOTAL,
+    RATE_LIMITED_TOTAL, INFERENCE_LATENCY, QUEUE_WAIT_TIME, QUEUE_DEPTH,
+)
+from prometheus_client import make_asgi_app
 
 ollama_client = OllamaClient()
 
@@ -24,6 +29,8 @@ app = FastAPI(
 
 
 # --- Schemas ---
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
 
 class GenerateRequest(BaseModel):
     prompt: str
@@ -62,9 +69,10 @@ async def shutdown():
 
 # --- Endpoints ---
 def enforce_rate_limit(request: Request):
-    client_key = request.client.host  # IP-based for now; swap for API key later
+    client_key = request.client.host
     allowed, retry_after = rate_limiter.check(client_key)
     if not allowed:
+        RATE_LIMITED_TOTAL.inc()
         raise HTTPException(
             status_code=429,
             detail=f"Rate limit exceeded. Retry after {retry_after:.1f}s",
@@ -75,16 +83,26 @@ def enforce_rate_limit(request: Request):
 async def generate(request: GenerateRequest, _=Depends(enforce_rate_limit)):
     cached = prompt_cache.get(request.prompt, config.TEMPERATURE, request.max_tokens)
     if cached:
+        CACHE_HITS_TOTAL.inc()
+        REQUESTS_TOTAL.labels(endpoint="/generate", status="cache_hit").inc()
         return GenerateResponse(**{**cached, "queue_wait_ms": 0.0})
 
+    CACHE_MISSES_TOTAL.inc()
     try:
         active_queue = redis_queue if redis_queue else inference_queue
         result = await active_queue.submit(request.prompt)
         prompt_cache.set(request.prompt, config.TEMPERATURE, request.max_tokens, result)
+
+        INFERENCE_LATENCY.observe(result["latency_ms"] / 1000)
+        QUEUE_WAIT_TIME.observe(result["queue_wait_ms"] / 1000)
+        REQUESTS_TOTAL.labels(endpoint="/generate", status="success").inc()
+
         return GenerateResponse(**result)
     except RuntimeError as e:
+        REQUESTS_TOTAL.labels(endpoint="/generate", status="queue_full").inc()
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
+        REQUESTS_TOTAL.labels(endpoint="/generate", status="error").inc()
         raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
 
 
