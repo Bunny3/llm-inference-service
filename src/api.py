@@ -6,6 +6,9 @@ from src.config import config
 from src.queue_worker import inference_queue
 from fastapi.responses import StreamingResponse
 from src.ollama_client import OllamaClient
+from fastapi import Request
+from src.rate_limiter import rate_limiter
+from fastapi import Depends
 
 ollama_client = OllamaClient()
 
@@ -48,9 +51,18 @@ async def shutdown():
 
 
 # --- Endpoints ---
+def enforce_rate_limit(request: Request):
+    client_key = request.client.host  # IP-based for now; swap for API key later
+    allowed, retry_after = rate_limiter.check(client_key)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded. Retry after {retry_after:.1f}s",
+            headers={"Retry-After": str(round(retry_after, 1))},
+        )
 
 @app.post("/generate", response_model=GenerateResponse)
-async def generate(request: GenerateRequest):
+async def generate(request: GenerateRequest, _=Depends(enforce_rate_limit)):
     """
     Submit a prompt for LLM inference.
     Requests are queued and processed one at a time for maximum throughput.
@@ -83,7 +95,7 @@ async def list_models():
     return {"models": client.list_models()}
 
 @app.post("/generate/stream")
-async def generate_stream(request: GenerateRequest):
+async def generate_stream(request: GenerateRequest, _=Depends(enforce_rate_limit)):
     try:
         token_gen = await inference_queue.submit_stream(request.prompt)
     except RuntimeError as e:
