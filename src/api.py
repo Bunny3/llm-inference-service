@@ -9,6 +9,8 @@ from src.ollama_client import OllamaClient
 from fastapi import Request
 from src.rate_limiter import rate_limiter
 from fastapi import Depends
+from src.cache import prompt_cache
+
 
 ollama_client = OllamaClient()
 
@@ -63,13 +65,13 @@ def enforce_rate_limit(request: Request):
 
 @app.post("/generate", response_model=GenerateResponse)
 async def generate(request: GenerateRequest, _=Depends(enforce_rate_limit)):
-    """
-    Submit a prompt for LLM inference.
-    Requests are queued and processed one at a time for maximum throughput.
-    Returns 503 if the queue is full.
-    """
+    cached = prompt_cache.get(request.prompt, config.TEMPERATURE, request.max_tokens)
+    if cached:
+        return GenerateResponse(**{**cached, "queue_wait_ms": 0.0})
+
     try:
         result = await inference_queue.submit(request.prompt)
+        prompt_cache.set(request.prompt, config.TEMPERATURE, request.max_tokens, result)
         return GenerateResponse(**result)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
@@ -84,6 +86,7 @@ async def health():
         "status": "ok",
         "model": config.OLLAMA_MODEL,
         **inference_queue.stats,
+        **prompt_cache.stats,
     }
 
 

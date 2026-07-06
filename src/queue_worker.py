@@ -111,5 +111,18 @@ class InferenceQueue:
 
         return token_generator()
 
+    @property
+    def queue_depth(self) -> int:
+        return self.queue.qsize()
+
+    @property
+    def stats(self) -> dict:
+        return {
+            "total_requests": self.total_requests,
+            "total_errors": self.total_errors,
+            "current_queue_depth": self.queue_depth,
+            "max_queue_depth": self.max_queue_depth,
+        }
+
 # Singleton — shared across all API requests
 inference_queue = InferenceQueue(max_queue_depth=10)
