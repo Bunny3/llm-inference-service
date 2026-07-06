@@ -1,3 +1,24 @@
+# LLM Inference Microservice
+
+A production-style LLM inference service built on Ollama, demonstrating
+the core patterns used in real inference servers (vLLM, TGI, TensorRT-LLM):
+async request queuing, token streaming, rate limiting, caching, durability,
+load testing, and observability.
+
+## Why this exists
+
+Most "call an LLM API" tutorials skip the part that actually matters in
+production: a single model instance can only process one generation
+efficiently at a time, failures need to degrade gracefully, and you need
+visibility into what's actually happening under load. This project builds
+that up milestone by milestone, with each one tested against real traffic
+before moving to the next.
+
+## Architecture
+Client → FastAPI → Rate Limiter → Cache → Queue (in-memory or Redis) → Ollama (llama3.2:3b)
+↓
+Prometheus metrics
+
 - **Single background worker** drains the queue one request at a time,
   running each blocking Ollama call in a thread pool (`run_in_executor`)
   so the event loop stays free to accept new connections.
