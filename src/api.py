@@ -4,7 +4,10 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from src.config import config
 from src.queue_worker import inference_queue
+from fastapi.responses import StreamingResponse
+from src.ollama_client import OllamaClient
 
+ollama_client = OllamaClient()
 
 app = FastAPI(
     title="LLM Inference Service",
@@ -78,3 +81,17 @@ async def list_models():
     from src.ollama_client import OllamaClient
     client = OllamaClient()
     return {"models": client.list_models()}
+
+@app.post("/generate/stream")
+async def generate_stream(request: GenerateRequest):
+    try:
+        token_gen = await inference_queue.submit_stream(request.prompt)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+    async def event_generator():
+        async for token in token_gen:
+            yield f"data: {token}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")

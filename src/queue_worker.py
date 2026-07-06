@@ -40,68 +40,76 @@ class InferenceQueue:
             print("🛑 Inference queue worker stopped.")
 
     async def _worker_loop(self):
-        """
-        Continuously pulls requests from the queue and processes them.
-        Runs as a background asyncio task for the lifetime of the server.
-        """
         while True:
-            # Wait for the next request — blocks here until one arrives
-            future, prompt, enqueued_at = await self.queue.get()
+            kind, payload, enqueued_at = await self.queue.get()
             wait_ms = (time.perf_counter() - enqueued_at) * 1000
+            loop = asyncio.get_event_loop()
 
-            try:
-                # Run the blocking Ollama call in a thread pool so it
-                # doesn't block the asyncio event loop for other tasks
-                loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(
-                    None,
-                    self.client.generate,
-                    prompt,
-                )
-                result["queue_wait_ms"] = round(wait_ms, 2)
-                self.total_requests += 1
-                future.set_result(result)
+            if kind == "sync":
+                future, prompt = payload
+                try:
+                    result = await loop.run_in_executor(None, self.client.generate, prompt)
+                    result["queue_wait_ms"] = round(wait_ms, 2)
+                    self.total_requests += 1
+                    future.set_result(result)
+                except Exception as e:
+                    self.total_errors += 1
+                    future.set_exception(e)
+                finally:
+                    self.queue.task_done()
 
-            except Exception as e:
-                self.total_errors += 1
-                future.set_exception(e)
+            elif kind == "stream":
+                output_queue, prompt = payload
+                try:
+                    await loop.run_in_executor(
+                        None, self._drain_stream, prompt, output_queue, loop
+                    )
+                    self.total_requests += 1
+                except Exception as e:
+                    self.total_errors += 1
+                    loop.call_soon_threadsafe(output_queue.put_nowait, e)
+                finally:
+                    self.queue.task_done()
 
-            finally:
-                self.queue.task_done()
+    def _drain_stream(self, prompt: str, output_queue: asyncio.Queue, loop):
+        """
+        Runs in a worker thread. Pulls tokens from Ollama's blocking
+        stream and hands each one to the event loop thread-safely —
+        asyncio.Queue.put_nowait isn't safe to call from this thread directly.
+        """
+        try:
+            for token in self.client.generate_stream(prompt):
+                loop.call_soon_threadsafe(output_queue.put_nowait, token)
+        finally:
+            loop.call_soon_threadsafe(output_queue.put_nowait, None)  # sentinel
 
     async def submit(self, prompt: str) -> dict:
-        """
-        Submit a prompt to the queue and wait for the result.
-        Raises a 503 error if the queue is full.
-        """
         if self.queue.full():
-            raise RuntimeError(
-                f"Queue is full ({self.max_queue_depth} requests waiting). "
-                f"Try again later."
-            )
-
-        # A Future lets the caller await the result even though
-        # it's processed by a separate background worker task
+            raise RuntimeError(f"Queue is full ({self.max_queue_depth} requests waiting). Try again later.")
         loop = asyncio.get_event_loop()
         future = loop.create_future()
         enqueued_at = time.perf_counter()
-
-        await self.queue.put((future, prompt, enqueued_at))
+        await self.queue.put(("sync", (future, prompt), enqueued_at))
         return await future
 
-    @property
-    def queue_depth(self) -> int:
-        return self.queue.qsize()
+    async def submit_stream(self, prompt: str):
+        """Returns an async generator yielding tokens, queued alongside sync requests."""
+        if self.queue.full():
+            raise RuntimeError(f"Queue is full ({self.max_queue_depth} requests waiting). Try again later.")
+        output_queue: asyncio.Queue = asyncio.Queue()
+        enqueued_at = time.perf_counter()
+        await self.queue.put(("stream", (output_queue, prompt), enqueued_at))
 
-    @property
-    def stats(self) -> dict:
-        return {
-            "total_requests": self.total_requests,
-            "total_errors": self.total_errors,
-            "current_queue_depth": self.queue_depth,
-            "max_queue_depth": self.max_queue_depth,
-        }
+        async def token_generator():
+            while True:
+                token = await output_queue.get()
+                if token is None:
+                    break
+                if isinstance(token, Exception):
+                    raise token
+                yield token
 
+        return token_generator()
 
 # Singleton — shared across all API requests
 inference_queue = InferenceQueue(max_queue_depth=10)

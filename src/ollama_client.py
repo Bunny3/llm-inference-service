@@ -2,7 +2,7 @@
 import time
 import requests
 from src.config import config
-
+import json
 
 class OllamaClient:
     """
@@ -76,3 +76,36 @@ class OllamaClient:
         response = requests.get(f"{self.base_url}/api/tags", timeout=5)
         response.raise_for_status()
         return [m["name"] for m in response.json().get("models", [])]
+    
+    def generate_stream(self, prompt: str):
+        """
+        Stream tokens from Ollama as they're generated.
+        Yields raw text chunks. Caller (FastAPI route) is responsible
+        for wrapping this in a StreamingResponse.
+        """
+        payload = {
+            "model": self.model,
+            "prompt": prompt,
+            "stream": True,
+            "options": {
+                "temperature": config.TEMPERATURE,
+                "num_predict": config.MAX_TOKENS,
+            }
+        }
+
+        with requests.post(
+            f"{self.base_url}/api/generate",
+            json=payload,
+            stream=True,
+            timeout=120,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                chunk = json.loads(line)
+                token = chunk.get("response", "")
+                if token:
+                    yield token
+                if chunk.get("done"):
+                    break
